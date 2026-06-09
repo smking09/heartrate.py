@@ -1,0 +1,276 @@
+import cv2
+import numpy as np
+from collections import deque
+import time
+
+
+WINDOW_SIZE = 150
+FPS_TARGET = 30
+MIN_BPM = 40
+MAX_BPM = 180
+
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cap.set(cv2.CAP_PROP_FPS, FPS_TARGET)
+
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+
+green_signal = deque(maxlen=WINDOW_SIZE)
+timestamps   = deque(maxlen=WINDOW_SIZE)
+bpm_history  = deque(maxlen=20)
+
+current_bpm  = 0
+status       = "Place face in frame..."
+status_color = (150, 150, 150)
+pulse_phase  = 0
+last_beat    = time.time()
+beat_flash   = 0
+
+def bandpass_filter(signal, fps, low=0.7, high=3.0):
+    fft = np.fft.rfft(signal)
+    freqs = np.fft.rfftfreq(len(signal), d=1.0/fps)
+    fft[(freqs < low) | (freqs > high)] = 0
+    return np.fft.irfft(fft)
+
+def get_bpm(signal, fps):
+    if len(signal) < 60:
+        return 0
+    sig = np.array(signal)
+    sig = sig - np.mean(sig)
+    filtered = bandpass_filter(sig, fps)
+    fft_vals = np.abs(np.fft.rfft(filtered))
+    freqs    = np.fft.rfftfreq(len(filtered), d=1.0/fps)
+    mask     = (freqs >= MIN_BPM/60) & (freqs <= MAX_BPM/60)
+    if not np.any(mask):
+        return 0
+    peak_freq = freqs[mask][np.argmax(fft_vals[mask])]
+    return peak_freq * 60
+
+def bpm_to_status(bpm):
+    if bpm == 0:
+        return "Measuring...", (150, 150, 150)
+    elif bpm < 50:
+        return "Very Low BPM", (255, 100, 100)
+    elif bpm < 60:
+        return "Low — Resting", (100, 200, 255)
+    elif bpm < 80:
+        return "Normal — Relaxed", (0, 255, 150)
+    elif bpm < 100:
+        return "Normal — Active", (0, 220, 255)
+    elif bpm < 120:
+        return "Elevated", (0, 165, 255)
+    elif bpm < 150:
+        return "High — Exercise?", (0, 100, 255)
+    else:
+        return "Very High!", (0, 0, 255)
+
+def draw_pulse_wave(frame, signal, x, y, w, h):
+    if len(signal) < 2:
+        return
+    sig = np.array(signal)
+    sig = sig - np.mean(sig)
+    mx  = np.max(np.abs(sig)) if np.max(np.abs(sig)) > 0 else 1
+
+    
+    cv2.rectangle(frame, (x, y), (x+w, y+h), (20, 20, 20), -1)
+    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 150), 1)
+
+   
+    for i in range(1, 4):
+        gy = y + i * h // 4
+        cv2.line(frame, (x, gy), (x+w, gy), (40, 40, 40), 1)
+
+    cy = y + h // 2
+    cv2.line(frame, (x, cy), (x+w, cy), (60, 60, 60), 1)
+
+    
+    pts = []
+    for i, val in enumerate(sig):
+        px = x + int(i * w / len(sig))
+        py = cy - int(val / mx * (h//2 - 5))
+        py = max(y+2, min(y+h-2, py))
+        pts.append((px, py))
+
+    for i in range(1, len(pts)):
+        alpha = i / len(pts)
+        color = (0, int(200 * alpha), int(100 * alpha))
+        cv2.line(frame, pts[i-1], pts[i], color, 2)
+
+   
+    if pts:
+        cv2.circle(frame, pts[-1], 4, (0, 255, 150), -1)
+
+    cv2.putText(frame, "PULSE WAVE", (x+5, y+15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 150), 1)
+
+def draw_bpm_gauge(frame, bpm, cx, cy, radius):
+    
+    cv2.circle(frame, (cx, cy), radius, (20, 20, 20), -1)
+    cv2.circle(frame, (cx, cy), radius, (0, 255, 150), 2)
+
+   
+    if bpm > 0:
+        normalized = min((bpm - MIN_BPM) / (MAX_BPM - MIN_BPM), 1.0)
+        angle = int(normalized * 270)
+        if bpm < 80:
+            arc_color = (0, 255, 150)
+        elif bpm < 120:
+            arc_color = (0, 200, 255)
+        else:
+            arc_color = (0, 80, 255)
+        cv2.ellipse(frame, (cx, cy), (radius-4, radius-4),
+                    -225, 0, angle, arc_color, 6)
+
+    
+    bpm_text = str(int(bpm)) if bpm > 0 else "--"
+    font_scale = 1.2 if bpm > 0 else 1.0
+    text_size = cv2.getTextSize(bpm_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 3)[0]
+    cv2.putText(frame, bpm_text,
+                (cx - text_size[0]//2, cy + text_size[1]//2),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 3)
+    cv2.putText(frame, "BPM", (cx - 18, cy + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+
+def draw_heartbeat_icon(frame, cx, cy, size, flash):
+    color = (0, int(100 + 155 * flash), int(50 + 50 * flash))
+    
+    pts = np.array([
+        [cx,      cy+size],
+        [cx-size, cy-size//2],
+        [cx-size//2, cy-size],
+        [cx,      cy-size//4],
+        [cx+size//2, cy-size],
+        [cx+size, cy-size//2],
+    ], np.int32)
+    cv2.polylines(frame, [pts], True, color, 2)
+
+frame_count = 0
+fps_actual  = FPS_TARGET
+fps_time    = time.time()
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        continue
+
+    frame = cv2.flip(frame, 1)
+    h, w  = frame.shape[:2]
+    frame_count += 1
+
+    
+    now = time.time()
+    if frame_count % 30 == 0:
+        fps_actual = 30 / (now - fps_time)
+        fps_time   = now
+
+    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(120, 120))
+
+    face_detected = len(faces) > 0
+
+    if face_detected:
+        x, y, fw, fh = faces[0]
+
+      
+        roi_x = x + fw//4
+        roi_y = y + int(fh * 0.05)
+        roi_w = fw//2
+        roi_h = int(fh * 0.25)
+
+        roi = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+
+        if roi.size > 0:
+            green_val = np.mean(roi[:, :, 1])
+            green_signal.append(green_val)
+            timestamps.append(now)
+
+            
+            if len(green_signal) >= 60:
+                bpm = get_bpm(list(green_signal), fps_actual)
+                if MIN_BPM < bpm < MAX_BPM:
+                    bpm_history.append(bpm)
+
+                if bpm_history:
+                    current_bpm = np.mean(list(bpm_history))
+                    status, status_color = bpm_to_status(current_bpm)
+
+                    
+                    beat_interval = 60.0 / current_bpm
+                    if now - last_beat > beat_interval:
+                        last_beat  = now
+                        beat_flash = 1.0
+            else:
+                samples_left = 60 - len(green_signal)
+                status       = f"Calibrating... {samples_left}s"
+                status_color = (0, 200, 255)
+
+        
+        cv2.rectangle(frame, (x, y), (x+fw, y+fh), (0, 255, 150), 2)
+
+       
+        cv2.rectangle(frame, (roi_x, roi_y), (roi_x+roi_w, roi_y+roi_h),
+                      (0, 200, 255), 2)
+        cv2.putText(frame, "FOREHEAD ROI", (roi_x, roi_y - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
+
+        
+        cv2.circle(frame, (x + fw//2, y + fh//2), 3, (0, 255, 0), -1)
+
+    else:
+        status       = "No face detected"
+        status_color = (100, 100, 255)
+
+
+    beat_flash = max(0, beat_flash - 0.05)
+
+    panel_x = w - 220
+    cv2.rectangle(frame, (panel_x, 0), (w, h), (10, 10, 10), -1)
+    cv2.line(frame, (panel_x, 0), (panel_x, h), (0, 255, 150), 1)
+
+    
+    draw_bpm_gauge(frame, current_bpm, panel_x + 110, 120, 80)
+
+    
+    draw_heartbeat_icon(frame, panel_x + 110, 230, 15, beat_flash)
+
+    
+    cv2.putText(frame, status, (panel_x + 10, 270),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, status_color, 1)
+
+    
+    draw_pulse_wave(frame, list(green_signal), panel_x + 10, 300, 200, 80)
+
+    
+    tips = [
+        "TIPS:",
+        "- Sit still",
+        "- Good lighting",
+        "- Face camera",
+        "- Wait 10 secs",
+    ]
+    for i, tip in enumerate(tips):
+        cv2.putText(frame, tip, (panel_x + 10, 410 + i * 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                    (100, 100, 100) if i > 0 else (0, 255, 150), 1)
+
+
+    cv2.rectangle(frame, (0, 0), (panel_x, 45), (10, 10, 10), -1)
+    cv2.putText(frame, "MysticMotion - Heart Rate Monitor", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 220, 0), 2)
+
+   
+    if beat_flash > 0.3:
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (panel_x, h), (0, 40, 0), -1)
+        cv2.addWeighted(overlay, beat_flash * 0.3, frame, 1, 0, frame)
+
+
+    cv2.putText(frame, f"FPS: {int(fps_actual)}", (10, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 80, 80), 1)
+
+    cv2.imshow("MysticMotion - Heart Rate", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows(
